@@ -351,7 +351,7 @@ def main():
     # Время запуска: 09:00 утра. Можно изменить.
     application.job_queue.run_daily(
         check_stock_and_notify,
-        time=time(hour=9, minute=0, second=0),
+        time=time(hour=20, minute=8, second=0),
         name="daily_stock_check"
     )
     print("Планировщик ежедневных уведомлений об остатках запущен (09:00).")
