@@ -24,7 +24,10 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 # --- Настройка Google Sheets ---
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
 # Файл, который мы загрузим на Render
 CREDS_FILE = '/etc/secrets/credentials.json'
 
