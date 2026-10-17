@@ -16,6 +16,10 @@ def home():
 def health():
     return "OK", 200
 
+def run_flask():
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
+
 # --- Настройка Telegram-бота ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -28,22 +32,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f.write(text + '\n')
     await update.message.reply_text(f'Принял ссылку: {text}\nСохранил в базу.')
 
-def run_bot():
+def main():
+    # 1. Запускаем Flask в фоновом потоке (чтобы Render видел, что мы живы)
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # 2. Запускаем Telegram-бота в ГЛАВНОМ потоке
     TOKEN = os.environ.get('BOT_TOKEN')
     if not TOKEN:
         print("Ошибка: токен не найден!")
         return
+        
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    print("Бот запускается...")
     application.run_polling()
 
-# --- Запуск ---
 if __name__ == '__main__':
-    # Запускаем бота в отдельном потоке, чтобы он не блокировал веб-сервер
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.start()
-    
-    # Запускаем Flask на порту, который требует Render
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    main()
