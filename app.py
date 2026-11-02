@@ -3,8 +3,9 @@ import logging
 import threading
 import re
 import json
-from datetime import datetime, time
-from typing import Optional, Dict, Any, List
+import asyncio
+from datetime import datetime
+from typing import Optional, Dict, Any
 from urllib.parse import urlparse
 
 from curl_cffi import requests as c_requests
@@ -16,7 +17,7 @@ from google.oauth2.service_account import Credentials
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- Настройка Flask ---
+# --- Flask ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -29,9 +30,9 @@ def health():
 
 def run_flask():
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
 
-# --- Настройка Google Sheets ---
+# --- Google Sheets ---
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
@@ -39,8 +40,8 @@ SCOPES = [
 CREDS_FILE = '/etc/secrets/credentials.json'
 
 HEADERS = [
-    "Дата", "Ссылка", "Маркетплейс", "Артикул", "Бренд", 
-    "Название", "Текущая цена", "Базовая/Средняя цена", 
+    "Дата", "Ссылка", "Маркетплейс", "Артикул", "Бренд",
+    "Название", "Текущая цена", "Базовая/Средняя цена",
     "Выгода (%)", "Продавец", "Рейтинг", "Отзывы", "Риск подделки", "Статус"
 ]
 
@@ -63,7 +64,6 @@ def save_to_sheet(analysis_data: Dict[str, Any]) -> bool:
         sheet = get_sheet()
         ensure_headers(sheet)
         date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        
         row = [
             date_str,
             analysis_data.get("link", "—"),
@@ -86,30 +86,26 @@ def save_to_sheet(analysis_data: Dict[str, Any]) -> bool:
         logging.error(f"Ошибка Google Sheets: {e}")
         return False
 
-# --- Парсеры публичных данных маркетплейсов ---
+# --- Разрешение коротких ссылок ---
 
 def resolve_short_url(url: str) -> str:
-    """Разворачивает короткие ссылки маркетплейсов с имитацией реального браузера."""
     if any(domain in url for domain in ["ozon.ru/t/", "wb.ru/", "clck.ru/", "ozon.onelink.me"]):
         try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-                "Accept-Language": "ru-RU,ru;q=0.9"
-            }
-            resp = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
-            return resp.url
+            resp = c_requests.get(url, impersonate="chrome120", allow_redirects=True, timeout=15)
+            final = resp.url
+            if final and final != url:
+                return final
         except Exception as e:
             logging.error(f"Ошибка редиректа короткой ссылки: {e}")
     return url
 
 def extract_product_info_from_url(url: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Определяет маркетплейс, артикул и полный путь страницы для парсинга."""
     resolved_url = resolve_short_url(url)
     logging.info(f"Финальный URL после редиректа: {resolved_url}")
-    
+
     parsed = urlparse(resolved_url)
     path = parsed.path
-    
+
     if "wildberries.ru" in resolved_url or "wb.ru" in resolved_url:
         match = re.search(r'/catalog/(\d+)/detail', resolved_url)
         if match:
@@ -120,47 +116,63 @@ def extract_product_info_from_url(url: str) -> tuple[Optional[str], Optional[str
             match = re.search(r'/product/.*?(\d{6,})', resolved_url)
         sku = match.group(1) if match else None
         return sku, "Ozon", path
-        
+
     return None, None, None
 
+# --- Wildberries (исправлено под v4) ---
+
 def analyze_wb_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
-    """Сбор и анализ данных Wildberries через актуальное публичное API v4."""
     try:
-        # Используем современный эндпоинт v4
         api_url = f"https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={sku}"
-        resp = requests.get(api_url, timeout=10)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        resp = requests.get(api_url, timeout=15, headers=headers)
         if resp.status_code != 200:
-            logging.warning(f"WB API ответил со статусом: {resp.status_code}")
+            logging.warning(f"WB API статус: {resp.status_code}")
             return None
-        
+
         data = resp.json()
         products = data.get("data", {}).get("products", [])
         if not products:
+            logging.warning(f"WB API: пустой список товаров для SKU {sku}")
             return None
-            
+
         p = products[0]
-        name = p.get("name", "Без названия")
-        brand = p.get("brand", "Не указан")
-        seller = p.get("supplier", "Сторонний продавец")
-        rating = p.get("reviewRating", 0.0)
-        reviews_count = p.get("feedbacks", 0)
-        
-        # На WB цены передаются в копейках (делим на 100)
-        price_raw = p.get("salePriceU", 0) / 100
-        old_price_raw = p.get("priceU", 0) / 100
-        
-        price = round(price_raw)
-        old_price = round(old_price_raw) if old_price_raw > price else price
-        
+        name = p.get("name") or "Без названия"
+        brand = p.get("brand") or "Не указан"
+        seller = p.get("supplier") or "Сторонний продавец"
+        rating = p.get("reviewRating") or 0.0
+        reviews_count = p.get("feedbacks") or 0
+
+        # v4: цены в sizes[0].price
+        price_kopecks = 0
+        old_price_kopecks = 0
+        sizes = p.get("sizes") or []
+        if sizes:
+            price_info = sizes[0].get("price") or {}
+            price_kopecks = price_info.get("product") or price_info.get("total") or 0
+            old_price_kopecks = price_info.get("basic") or 0
+
+        # Fallback на старый формат
+        if price_kopecks == 0:
+            price_kopecks = p.get("salePriceU") or p.get("priceU") or 0
+            old_price_kopecks = p.get("priceU") or 0
+
+        price = round(price_kopecks / 100) if price_kopecks else 0
+        old_price = round(old_price_kopecks / 100) if old_price_kopecks > price_kopecks else price
+
+        if price == 0:
+            logging.warning(f"WB: не удалось определить цену для SKU {sku}")
+            return None
+
         discount_percent = 0
         if old_price > price:
             discount_percent = round(((old_price - price) / old_price) * 100)
-            
+
         risk_level, risk_reason = calculate_replica_risk(
-            brand=brand, seller=seller, rating=rating, 
-            reviews_count=reviews_count, discount_percent=discount_percent
+            brand=brand, seller=seller, rating=float(rating),
+            reviews_count=int(reviews_count), discount_percent=discount_percent
         )
-        
+
         return {
             "link": url,
             "marketplace": "Wildberries",
@@ -181,87 +193,108 @@ def analyze_wb_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
         logging.error(f"Ошибка парсинга WB: {e}")
         return None
 
+# --- Ozon (исправлено: реальная старая цена) ---
+
 def analyze_ozon_product(sku: str, url: str, path: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Надежный парсинг Ozon через загрузку HTML страницы и извлечение данных из JSON-LD."""
     try:
         clean_url = f"https://www.ozon.ru/product/{sku}/"
         logging.info(f"Загрузка страницы Ozon: {clean_url}")
-        
-        resp = c_requests.get(clean_url, impersonate="chrome120", timeout=15)
-        logging.info(f"Ozon страница ответ: статус {resp.status_code}")
-        
+
+        resp = c_requests.get(clean_url, impersonate="chrome120", timeout=20)
+        logging.info(f"Ozon ответ: статус {resp.status_code}")
+
         if resp.status_code != 200:
-            logging.warning(f"Ozon заблокировал страницу. Статус: {resp.status_code}")
+            logging.warning(f"Ozon заблокировал. Статус: {resp.status_code}")
             return None
 
         soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        name = "Без названия"
+
+        name = None
         price = 0
         old_price = 0
-        rating = 4.8
-        reviews_count = 100
+        rating = 0.0
+        reviews_count = 0
         brand = "Не указан"
         seller = "Ozon"
 
-        # Ищем JSON-LD разметку (Schema.org Product)
-        ld_json_scripts = soup.find_all('script', type='application/ld+json')
-        for script in ld_json_scripts:
+        for script in soup.find_all('script', type='application/ld+json'):
             try:
-                data = json.loads(script.string)
+                data = json.loads(script.string or "")
                 items = data if isinstance(data, list) else [data]
                 for item in items:
-                    if item.get("@type") == "Product":
-                        if "name" in item:
-                            name = item["name"]
-                        if "brand" in item:
-                            b = item["brand"]
-                            if isinstance(b, dict):
-                                brand = b.get("name", brand)
-                            elif isinstance(b, str):
-                                brand = b
-                        
-                        offers = item.get("offers", {})
-                        if isinstance(offers, dict):
-                            p = offers.get("price") or offers.get("lowPrice")
-                            if p:
-                                price = int(float(p))
-                        
-                        agg = item.get("aggregateRating", {})
-                        if isinstance(agg, dict):
-                            if "ratingValue" in agg:
-                                rating = float(agg["ratingValue"])
-                            if "reviewCount" in agg:
-                                reviews_count = int(agg["reviewCount"])
-            except Exception:
-                continue
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("@type") != "Product":
+                        continue
 
-        # Запасной вариант для названия через OpenGraph теги
-        if name == "Без названия" or not name:
-            og_title = soup.find('meta', property='og:title')
-            if og_title and og_title.get('content'):
-                name = og_title['content']
-            else:
-                h1 = soup.find('h1')
-                if h1:
-                    name = h1.get_text(strip=True)
+                    if item.get("name"):
+                        name = item["name"]
 
-        # Запасной вариант для цены из скриптов страницы
+                    b = item.get("brand")
+                    if isinstance(b, dict):
+                        brand = b.get("name") or brand
+                    elif isinstance(b, str):
+                        brand = b
+
+                    offers = item.get("offers", {})
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
+                    if isinstance(offers, dict):
+                        p_val = offers.get("price") or offers.get("lowPrice")
+                        if p_val:
+                            price = int(float(p_val))
+                        ps = offers.get("priceSpecification")
+                        specs = ps if isinstance(ps, list) else [ps] if isinstance(ps, dict) else []
+                        for spec in specs:
+                            if not isinstance(spec, dict):
+                                continue
+                            if spec.get("priceType") in ("ListPrice", "StrikethroughPrice"):
+                                try:
+                                    old_price = int(float(spec.get("price", 0)))
+                                except (TypeError, ValueError):
+                                    pass
+
+                    agg = item.get("aggregateRating", {})
+                    if isinstance(agg, dict):
+                        try:
+                            rating = float(agg.get("ratingValue") or 0)
+                        except (TypeError, ValueError):
+                            rating = 0.0
+                        try:
+                            reviews_count = int(agg.get("reviewCount") or 0)
+                        except (TypeError, ValueError):
+                            reviews_count = 0
+            except Exception as e:
+                logging.debug(f"JSON-LD parse: {e}")
+
+        if not name:
+            og = soup.find('meta', property='og:title')
+            if og and og.get('content'):
+                name = og['content']
+
         if price == 0:
-            text_content = resp.text
-            match_price = re.search(r'"price"\s*:\s*"(\d+)"', text_content)
-            if match_price:
-                price = int(match_price.group(1))
+            m = re.search(r'"price"\s*:\s*"?(\d+)"?', resp.text)
+            if m:
+                price = int(m.group(1))
+
+        if old_price == 0:
+            m = re.search(r'"(?:originalPrice|oldPrice)"\s*:\s*"?(\d+)"?', resp.text)
+            if m:
+                old_price = int(m.group(1))
+
+        if old_price < price:
+            old_price = price
 
         if not name or price == 0:
-            logging.warning("Не удалось извлечь название или цену Ozon.")
+            logging.warning("Ozon: не удалось извлечь название или цену.")
             return None
 
-        old_price = int(price * 1.3) if price > 0 else 0
-        discount_percent = 23 if old_price > price else 0
+        discount_percent = 0
+        if old_price > price:
+            discount_percent = round(((old_price - price) / old_price) * 100)
 
         risk_level, risk_reason = calculate_replica_risk(
-            brand=brand, seller=seller, rating=rating, 
+            brand=brand, seller=seller, rating=rating,
             reviews_count=reviews_count, discount_percent=discount_percent
         )
 
@@ -282,18 +315,17 @@ def analyze_ozon_product(sku: str, url: str, path: Optional[str] = None) -> Opti
             "delivery_time": "По данным площадки"
         }
     except Exception as e:
-        logging.error(f"Ошибка парсинга HTML Ozon: {e}")
+        logging.error(f"Ошибка парсинга Ozon: {e}")
         return None
 
 def calculate_replica_risk(brand: str, seller: str, rating: float, reviews_count: int, discount_percent: int) -> tuple[str, str]:
-    """Логика оценки риска покупки подделки (пали)."""
     score = 0
     reasons = []
 
-    if brand.lower() in seller.lower() or seller.lower() in ["wildberries", "ozon"]:
+    if brand and seller and (brand.lower() in seller.lower() or seller.lower() in ["wildberries", "ozon"]):
         score -= 2
         reasons.append("Официальный продавец/маркетплейс")
-    
+
     if rating < 4.0 and reviews_count > 10:
         score += 3
         reasons.append("Низкий рейтинг товара (< 4.0)")
@@ -302,20 +334,20 @@ def calculate_replica_risk(brand: str, seller: str, rating: float, reviews_count
 
     if reviews_count < 5:
         score += 2
-        reasons.append("Мало отзывов (новый или подозрительный товар)")
+        reasons.append("Мало отзывов")
 
     if discount_percent > 70:
         score += 2
         reasons.append(f"Аномально большая скидка ({discount_percent}%)")
 
     if score >= 3:
-        return "🔴 Высокий (Есть риск пали!)", " | ".join(reasons)
+        return "🔴 Высокий (Есть риск пали!)", " | ".join(reasons) or "Совокупность негативных факторов"
     elif score >= 1:
-        return "🟡 Средний (Требуется внимание)", " | ".join(reasons) if reasons else "Недостаточно проверен"
+        return "🟡 Средний (Требуется внимание)", " | ".join(reasons) or "Недостаточно проверен"
     else:
         return "🟢 Низкий (Надёжное предложение)", "Продавец и отзывы внушают доверие"
 
-# --- Telegram-хэндлеры ---
+# --- Telegram ---
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -326,58 +358,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 **Привет! Я Sellertano — твой умный Анализатор Рынка.**\n\n"
         "🔍 **Что я умею:**\n"
-        "• Анализировать товары на маркетплейсах (Wildberries, Ozon).\n"
-        "• Считать выгоду, переплату и среднюю цену.\n"
-        "• Оценивать **риск подделки (пали)** на основе рейтинга и продавца.\n"
-        "• Сохранять все данные в единую Google Таблицу.\n\n"
-        "📥 Просто **отправь мне ссылку на любой товар!**",
+        "• Анализировать товары на Wildberries и Ozon.\n"
+        "• Считать выгоду и реальную скидку.\n"
+        "• Оценивать **риск подделки (пали)**.\n"
+        "• Сохранять данные в Google Таблицу.\n\n"
+        "📥 **Отправь ссылку на любой товар!**",
         parse_mode="Markdown"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text.startswith("http"):
-        await update.message.reply_text("Пожалуйста, отправь прямую ссылку на товар (начиная с http:// или https://).")
+        await update.message.reply_text("Пожалуйста, отправь прямую ссылку на товар (http:// или https://).")
         return
 
     sku, mp, path = extract_product_info_from_url(text)
-    
+
     if not sku:
-        await update.message.reply_text("⚠️ Не удалось распознать ссылку маркетплейса. Поддерживаются ссылки на Wildberries и Ozon.")
+        await update.message.reply_text("⚠️ Не удалось распознать ссылку. Поддерживаются Wildberries и Ozon.")
         return
 
-    await update.message.reply_text(f"🔎 Анализирую товар на {mp}... Подождите пару секунд.")
+    await update.message.reply_text(f"🔎 Анализирую товар на {mp}...")
 
+    # Выносим блокирующие парсеры в отдельный поток
     if mp == "Wildberries":
-        data = analyze_wb_product(sku, text)
+        data = await asyncio.to_thread(analyze_wb_product, sku, text)
     else:
-        data = analyze_ozon_product(sku, text, path)
+        data = await asyncio.to_thread(analyze_ozon_product, sku, text, path)
 
     if not data:
-        await update.message.reply_text("❌ Не удалось получить данные по этой ссылке. Возможно, товар временно недоступен.")
+        await update.message.reply_text("❌ Не удалось получить данные. Возможно, товар недоступен или площадка блокирует запросы.")
         return
 
-    # Сохраняем в Google Таблицу
-    save_to_sheet(data)
+    # Сохранение в таблицу тоже блокирующее — тоже в поток
+    await asyncio.to_thread(save_to_sheet, data)
 
-    # Формируем отчет пользователю
     report = (
-        f"📊 **ОТЧЕТ SELLERTANO по товару**\n"
+        f"📊 **ОТЧЕТ SELLERTANO**\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📦 **Товар:** {data['name']}\n"
         f"🏷 **Бренд:** {data['brand']}\n"
         f"🏪 **Продавец:** {data['seller']}\n\n"
-        
         f"💰 **Текущая цена:** {data['price']} ₽\n"
-        f"🏷 **Базовая/Средняя цена:** {data['old_price']} ₽\n"
-        f"🔥 **Выгода:** {data['discount_percent']}% (Экономия: {data['old_price'] - data['price']} ₽)\n\n"
-        
-        f"⭐ **Рейтинг:** {data['rating']} / 5.0 ({data['reviews_count']} отзывов)\n"
+        f"🏷 **Базовая цена:** {data['old_price']} ₽\n"
+        f"🔥 **Выгода:** {data['discount_percent']}%"
+        f" (Экономия: {max(0, data['old_price'] - data['price'])} ₽)\n\n"
+        f"⭐ **Рейтинг:** {data['rating']} / 5.0 ({data['reviews_count']} отзывов)\n"
         f"🚚 **Доставка:** ~{data['delivery_time']}\n"
-        f"🛡 **Риск подделки (пали):** {data['risk_level']}\n"
+        f"🛡 **Риск подделки:** {data['risk_level']}\n"
         f"💬 _Детали:_ {data['risk_reason']}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ _Данные сохранены в базу Sellertano DB._"
+        f"✅ _Данные сохранены в Sellertano DB._"
     )
 
     await update.message.reply_text(report, parse_mode="Markdown")
@@ -392,15 +423,14 @@ def main():
 
     TOKEN = os.environ.get('BOT_TOKEN')
     if not TOKEN:
-        print("Ошибка: токен BOT_TOKEN не найден!")
+        print("Ошибка: BOT_TOKEN не найден!")
         return
 
     application = Application.builder().token(TOKEN).post_init(post_init).build()
-
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Sellertano Market Analyzer успешно запущен!")
+    print("Sellertano Market Analyzer запущен!")
     application.run_polling()
 
 if __name__ == '__main__':

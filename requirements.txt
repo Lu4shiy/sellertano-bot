@@ -3,5 +3,5 @@ Flask
 gspread
 google-auth
 requests
-curl_cffi
+curl_cffi>=0.7.0
 beautifulsoup4
