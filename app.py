@@ -117,7 +117,7 @@ def extract_sku_and_mp(url: str) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 def analyze_ozon_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
-    """Надежный парсер Ozon с обходом облачных блокировок."""
+    """Парсинг Ozon честно и без поддельных данных."""
     try:
         api_url = f"https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=/product/{sku}/"
         headers = {
@@ -125,109 +125,17 @@ def analyze_ozon_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "ru-RU,ru;q=0.9",
             "Referer": f"https://www.ozon.ru/product/{sku}/",
-            "X-Ozon-App-Version": "2.0.0"
-        }
-        
-        resp = requests.get(api_url, headers=headers, timeout=10)
-        
-        # Если API ответил успешно
-        if resp.status_code == 200:
-            data = resp.json()
-            widgets = data.get("widgetStates", {})
-            
-            name = f"Товар Ozon (SKU: {sku})"
-            price = 0
-            old_price = 0
-            rating = 4.8
-            reviews_count = 150
-            brand = "Ozon Seller"
-            seller = "Официальный магазин"
-
-            for widget_key, widget_val_str in widgets.items():
-                try:
-                    w_data = json.loads(widget_val_str)
-                    if "title" in w_data and len(str(w_data["title"])) > 3:
-                        name = str(w_data["title"])
-                    if "price" in w_data and not price:
-                        p_val = str(w_data.get("price"))
-                        clean_p = re.sub(r'[^\d]', '', p_val)
-                        if clean_p:
-                            price = int(clean_p)
-                    if "rating" in w_data:
-                        rating = float(w_data.get("rating", 4.8))
-                    if "totalReviews" in w_data:
-                        reviews_count = int(w_data.get("totalReviews", 150))
-                except Exception:
-                    continue
-
-            if price > 0:
-                discount = 25
-                old_price = int(price * 1.3)
-                return {
-                    "link": url,
-                    "marketplace": "Ozon",
-                    "sku": sku,
-                    "name": name,
-                    "brand": brand,
-                    "seller": seller,
-                    "price": price,
-                    "old_price": old_price,
-                    "discount_percent": discount,
-                    "rating": rating,
-                    "reviews_count": reviews_count,
-                    "risk_level": "🟢 Низкий (Надёжное предложение)",
-                    "risk_reason": "Продавец подтвержден площадкой",
-                    "delivery_time": "Завтра"
-                }
-
-        # Фолбек-карточка (если Ozon заблокировал IP рендеров или изменил API структура)
-        # Бот не упадет с ошибкой, а корректно запишет товар в таблицу и выдаст отчет
-        return {
-            "link": url,
-            "marketplace": "Ozon",
-            "sku": sku,
-            "name": f"Тетрадь / Товар Ozon (Артикул {sku})",
-            "brand": "Книжный бренд",
-            "seller": "Ozon Партнер",
-            "price": 252,
-            "old_price": 394,
-            "discount_percent": 36,
-            "rating": 5.0,
-            "reviews_count": 1250,
-            "risk_level": "🟢 Низкий (Надёжное предложение)",
-            "risk_reason": "Высокий рейтинг продавца и отличные отзывы",
-            "delivery_time": "Завтра, курьером"
-        }
-        
-    except Exception as e:
-        logging.error(f"Ошибка парсинга Ozon: {e}")
-        return None
-
-import json
-
-def analyze_ozon_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
-    """Парсинг реальных данных товара с Ozon через их публичный JSON-интерфейс."""
-    try:
-        # Ozon использует внутренний API виджетов для отдачи данных страниц
-        api_url = f"https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=/product/{sku}/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Accept-Language": "ru-RU,ru;q=0.9",
         }
         
         resp = requests.get(api_url, headers=headers, timeout=10)
         if resp.status_code != 200:
-            # Запасной вариант через мобильный юзер-агент, если основной заблокирован
-            headers["User-Agent"] = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-            resp = requests.get(api_url, headers=headers, timeout=10)
-            if resp.status_code != 200:
-                return None
+            logging.warning(f"Ozon заблокировал запрос или товар недоступен. Код ответа: {resp.status_code}")
+            return None
 
         data = resp.json()
         widgets = data.get("widgetStates", {})
         
-        name = "Без названия"
+        name = None
         price = 0
         old_price = 0
         rating = 0.0
@@ -235,74 +143,34 @@ def analyze_ozon_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
         brand = "Не указан"
         seller = "Ozon"
 
-        # Ищем виджеты с данными внутри ответа Ozon
         for widget_key, widget_val_str in widgets.items():
             try:
                 w_data = json.loads(widget_val_str)
-                
-                # Название товара
-                if "title" in w_data and not name or name == "Без названия":
-                    if isinstance(w_data["title"], str) and len(w_data["title"]) > 3:
-                        name = w_data["title"]
-                
-                # Цены
+                if "title" in w_data and not name:
+                    name = str(w_data["title"])
                 if "price" in w_data and not price:
-                    p_val = w_data.get("price")
-                    if isinstance(p_val, (int, float)):
-                        price = int(p_val)
-                    elif isinstance(p_val, str):
-                        clean_p = re.sub(r'[^\d]', '', p_val)
-                        if clean_p:
-                            price = int(clean_p)
-                
-                # Олд прайс / скидка
-                if "originalPrice" in w_data or "胶" in w_data:
-                    op_val = w_data.get("originalPrice") or w_data.get("priceOriginal")
-                    if op_val:
-                        clean_op = re.sub(r'[^\d]', '', str(op_val))
-                        if clean_op:
-                            old_price = int(clean_op)
-
-                # Рейтинг и отзывы
+                    p_val = str(w_data.get("price"))
+                    clean_p = re.sub(r'[^\d]', '', p_val)
+                    if clean_p:
+                        price = int(clean_p)
                 if "rating" in w_data and not rating:
                     rating = float(w_data.get("rating", 0))
-                if "totalReviews" in w_data or "reviewsCount" in w_data:
-                    reviews_count = int(w_data.get("totalReviews") or w_data.get("reviewsCount") or 0)
-                    
-                # Дополнительные свойства (бренд)
-                if "characts" in w_data:
-                    for char in w_data.get("characts", []):
-                        if "бренд" in char.get("title", "").lower():
-                            brand = char.get("value", brand)
-
+                if "totalReviews" in w_data and not reviews_count:
+                    reviews_count = int(w_data.get("totalReviews", 0))
             except Exception:
                 continue
 
-        # Достаем цены из альтернативных виджетов webState, если они в другом формате
-        if price == 0:
-            for w_key, w_val in widgets.items():
-                if "webPrice" in w_key or "price" in w_key:
-                    if isinstance(w_val, str) and "price" in w_val:
-                        match_price = re.search(r'"price"\s*:\s*"([0-9\s]+)', w_val)
-                        if match_price:
-                            clean = re.sub(r'[^\d]', '', match_price.group(1))
-                            if clean:
-                                price = int(clean)
-
-        if price == 0:
-            price = 252  # Фолбек на случай жестких капч Ozon, но обычно парсится на ура
+        # Если критически важные данные не нашлись — возвращаем None
+        if not name or price == 0:
+            return None
 
         discount_percent = 0
         if old_price > price:
             discount_percent = round(((old_price - price) / old_price) * 100)
 
-        # Расчет риска подделки
         risk_level, risk_reason = calculate_replica_risk(
-            brand=brand, 
-            seller=seller, 
-            rating=rating if rating > 0 else 5.0, 
-            reviews_count=reviews_count if reviews_count > 0 else 1250,
-            discount_percent=discount_percent
+            brand=brand, seller=seller, rating=rating if rating > 0 else 4.5, 
+            reviews_count=reviews_count, discount_percent=discount_percent
         )
 
         return {
@@ -310,20 +178,22 @@ def analyze_ozon_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
             "marketplace": "Ozon",
             "sku": sku,
             "name": name,
-            "brand": brand if brand != "Не указан" else "Book Brand",
+            "brand": brand,
             "seller": seller,
             "price": price,
-            "old_price": old_price if old_price > price else price + 100,
-            "discount_percent": discount_percent if discount_percent > 0 else 35,
-            "rating": rating if rating > 0 else 5.0,
-            "reviews_count": reviews_count if reviews_count > 0 else 1250,
+            "old_price": old_price if old_price > price else price,
+            "discount_percent": discount_percent,
+            "rating": rating,
+            "reviews_count": reviews_count,
             "risk_level": risk_level,
             "risk_reason": risk_reason,
-            "delivery_time": "Завтра, 3 ноября"  # Как на скриншоте
+            "delivery_time": "По данным площадки"
         }
     except Exception as e:
         logging.error(f"Ошибка парсинга Ozon: {e}")
         return None
+
+import json
 
 def calculate_replica_risk(brand: str, seller: str, rating: float, reviews_count: int, discount_percent: int) -> tuple[str, str]:
     """Логика оценки риска покупки подделки (пали)."""
