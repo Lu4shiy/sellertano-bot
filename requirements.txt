@@ -4,3 +4,4 @@ gspread
 google-auth
 requests
 curl_cffi
+beautifulsoup4
