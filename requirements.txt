@@ -4,7 +4,11 @@ gspread
 google-auth
 requests
 curl_cffi>=0.7.0
+<<<<<<< HEAD
 beautifulsoup4
 cloudscraper
 playwright
 playwright-stealth
+=======
+beautifulsoup4
+>>>>>>> ab4dc9d655af3e7a064dee474616626456f727d1
