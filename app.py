@@ -2,10 +2,12 @@ import os
 import logging
 import threading
 import re
+import json
 from datetime import datetime, time
 from typing import Optional, Dict, Any, List
-from curl_cffi import requests as c_requests
+from urllib.parse import urlparse
 
+from curl_cffi import requests as c_requests
 import requests
 from flask import Flask
 import gspread
@@ -99,34 +101,96 @@ def resolve_short_url(url: str) -> str:
             logging.error(f"Ошибка редиректа короткой ссылки: {e}")
     return url
 
-def extract_sku_and_mp(url: str) -> tuple[Optional[str], Optional[str]]:
-    """Определяет маркетплейс и вытаскивает артикул с учетом коротких ссылок."""
+def extract_product_info_from_url(url: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Определяет маркетплейс, артикул и полный путь страницы для API."""
     resolved_url = resolve_short_url(url)
     logging.info(f"Финальный URL после редиректа: {resolved_url}")
+    
+    parsed = urlparse(resolved_url)
+    path = parsed.path  # Например: /product/tetrad-...-1722068453/
     
     if "wildberries.ru" in resolved_url or "wb.ru" in resolved_url:
         match = re.search(r'/catalog/(\d+)/detail', resolved_url)
         if match:
-            return match.group(1), "Wildberries"
+            return match.group(1), "Wildberries", None
     elif "ozon.ru" in resolved_url:
-        # Ищем артикул в длинной ссылке Ozon (цифры на конце перед слешем или параметрами)
-        match = re.search(r'-(\d+)(?:[/?]|$)', resolved_url)
+        match = re.search(r'-(\d+)(?:[/?]|$)', path)
         if not match:
             match = re.search(r'/product/.*?(\d{6,})', resolved_url)
-        if match:
-            return match.group(1), "Ozon"
-    return None, None
-
-def analyze_ozon_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
-    """Реальный парсинг Ozon с обходом Cloudflare через эмуляцию браузера (curl_cffi)."""
-    try:
-        api_url = f"https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=/product/{sku}/"
+        sku = match.group(1) if match else None
+        return sku, "Ozon", path
         
-        # Эмулируем настоящий браузер Chrome на уровне TLS-соединения
+    return None, None, None
+
+def analyze_wb_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
+    """Сбор и анализ данных Wildberries через открытые API."""
+    try:
+        api_url = f"https://card.wb.ru/cards/v1/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={sku}"
+        resp = requests.get(api_url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        
+        data = resp.json()
+        products = data.get("data", {}).get("products", [])
+        if not products:
+            return None
+            
+        p = products[0]
+        name = p.get("name", "Без названия")
+        brand = p.get("brand", "Не указан")
+        seller = p.get("supplier", "Сторонний продавец")
+        rating = p.get("reviewRating", 0.0)
+        reviews_count = p.get("feedbacks", 0)
+        
+        price_raw = p.get("salePriceU", 0) / 100
+        old_price_raw = p.get("priceU", 0) / 100
+        
+        price = round(price_raw)
+        old_price = round(old_price_raw) if old_price_raw > price else price
+        
+        discount_percent = 0
+        if old_price > price:
+            discount_percent = round(((old_price - price) / old_price) * 100)
+            
+        risk_level, risk_reason = calculate_replica_risk(
+            brand=brand, seller=seller, rating=rating, 
+            reviews_count=reviews_count, discount_percent=discount_percent
+        )
+        
+        return {
+            "link": url,
+            "marketplace": "Wildberries",
+            "sku": sku,
+            "name": name,
+            "brand": brand,
+            "seller": seller,
+            "price": price,
+            "old_price": old_price,
+            "discount_percent": discount_percent,
+            "rating": rating,
+            "reviews_count": reviews_count,
+            "risk_level": risk_level,
+            "risk_reason": risk_reason,
+            "delivery_time": "1-3 дня"
+        }
+    except Exception as e:
+        logging.error(f"Ошибка парсинга WB: {e}")
+        return None
+
+def analyze_ozon_product(sku: str, url: str, path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Реальный парсинг Ozon через composer-api с использованием точного пути товара."""
+    try:
+        if not path:
+            path = f"/product/{sku}/"
+            
+        api_url = f"https://www.ozon.ru/api/composer-api.bx/page/json/v2?url={path}"
+        logging.info(f"Запрос к Ozon API: {api_url}")
+        
         resp = c_requests.get(api_url, impersonate="chrome120", timeout=15)
+        logging.info(f"Ozon API ответ: статус {resp.status_code}")
         
         if resp.status_code != 200:
-            logging.warning(f"Ozon заблокировал запрос. Код ответа: {resp.status_code}")
+            logging.warning(f"Ozon заблокировал запрос. Текст: {resp.text[:200]}")
             return None
 
         data = resp.json()
@@ -162,7 +226,6 @@ def analyze_ozon_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 continue
 
-        # Если критически важные данные не нашлись — честно возвращаем None
         if not name or price == 0:
             return None
 
@@ -195,36 +258,29 @@ def analyze_ozon_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
         logging.error(f"Ошибка реального парсинга Ozon через curl_cffi: {e}")
         return None
 
-import json
-
 def calculate_replica_risk(brand: str, seller: str, rating: float, reviews_count: int, discount_percent: int) -> tuple[str, str]:
     """Логика оценки риска покупки подделки (пали)."""
     score = 0
     reasons = []
 
-    # 1. Проверка продавца
     if brand.lower() in seller.lower() or seller.lower() in ["wildberries", "ozon"]:
         score -= 2
         reasons.append("Официальный продавец/маркетплейс")
     
-    # 2. Рейтинг
     if rating < 4.0 and reviews_count > 10:
         score += 3
         reasons.append("Низкий рейтинг товара (< 4.0)")
     elif rating >= 4.7:
         score -= 1
 
-    # 3. Количество отзывов
     if reviews_count < 5:
         score += 2
         reasons.append("Мало отзывов (новый или подозрительный товар)")
 
-    # 4. Аномальная скидка
     if discount_percent > 70:
         score += 2
         reasons.append(f"Аномально большая скидка ({discount_percent}%)")
 
-    # Итоговая оценка
     if score >= 3:
         return "🔴 Высокий (Есть риск пали!)", " | ".join(reasons)
     elif score >= 1:
@@ -257,7 +313,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пожалуйста, отправь прямую ссылку на товар (начиная с http:// или https://).")
         return
 
-    sku, mp = extract_sku_and_mp(text)
+    sku, mp, path = extract_product_info_from_url(text)
     
     if not sku:
         await update.message.reply_text("⚠️ Не удалось распознать ссылку маркетплейса. Поддерживаются ссылки на Wildberries и Ozon.")
@@ -268,7 +324,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mp == "Wildberries":
         data = analyze_wb_product(sku, text)
     else:
-        data = analyze_ozon_product(sku, text)
+        data = analyze_ozon_product(sku, text, path)
 
     if not data:
         await update.message.reply_text("❌ Не удалось получить данные по этой ссылке. Возможно, товар временно недоступен.")
