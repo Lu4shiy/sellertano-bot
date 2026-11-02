@@ -10,14 +10,13 @@ from urllib.parse import urlparse
 
 from curl_cffi import requests as c_requests
 from bs4 import BeautifulSoup
-import requests
-from flask import Flask
 import gspread
 from google.oauth2.service_account import Credentials
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- Flask ---
+from flask import Flask
 app = Flask(__name__)
 
 @app.route('/')
@@ -86,23 +85,22 @@ def save_to_sheet(analysis_data: Dict[str, Any]) -> bool:
         logging.error(f"Ошибка Google Sheets: {e}")
         return False
 
-# --- Разрешение коротких ссылок ---
-
+# --- Разрешение коротких ссылок (через curl_cffi) ---
 def resolve_short_url(url: str) -> str:
-    if any(domain in url for domain in ["ozon.ru/t/", "wb.ru/", "clck.ru/", "ozon.onelink.me"]):
+    if any(domain in url for domain in ["ozon.ru/t/", "wb.ru/", "clck.ru", "ozon.onelink.me"]):
         try:
             resp = c_requests.get(url, impersonate="chrome120", allow_redirects=True, timeout=15)
             final = resp.url
             if final and final != url:
                 return final
         except Exception as e:
-            logging.error(f"Ошибка редиректа короткой ссылки: {e}")
+            logging.error(f"Ошибка редиректа: {e}")
     return url
 
 def extract_product_info_from_url(url: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
     resolved_url = resolve_short_url(url)
-    logging.info(f"Финальный URL после редиректа: {resolved_url}")
-
+    logging.info(f"Финальный URL: {resolved_url}")
+    
     parsed = urlparse(resolved_url)
     path = parsed.path
 
@@ -116,24 +114,28 @@ def extract_product_info_from_url(url: str) -> tuple[Optional[str], Optional[str
             match = re.search(r'/product/.*?(\d{6,})', resolved_url)
         sku = match.group(1) if match else None
         return sku, "Ozon", path
-
     return None, None, None
 
-# --- Wildberries (исправлено под v4) ---
-
+# --- Парсер Wildberries (исправленный v4) ---
 def analyze_wb_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
     try:
         api_url = f"https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={sku}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = requests.get(api_url, timeout=15, headers=headers)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        # Используем curl_cffi для обхода проверки TLS
+        resp = c_requests.get(api_url, headers=headers, impersonate="chrome120", timeout=15)
+        
         if resp.status_code != 200:
-            logging.warning(f"WB API статус: {resp.status_code}")
+            logging.warning(f"WB API статус: {resp.status_code}. Ответ: {resp.text[:200]}")
             return None
 
         data = resp.json()
         products = data.get("data", {}).get("products", [])
         if not products:
-            logging.warning(f"WB API: пустой список товаров для SKU {sku}")
+            logging.warning(f"WB: пустой список товаров для SKU {sku}")
             return None
 
         p = products[0]
@@ -143,7 +145,7 @@ def analyze_wb_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
         rating = p.get("reviewRating") or 0.0
         reviews_count = p.get("feedbacks") or 0
 
-        # v4: цены в sizes[0].price
+        # v4 структура цен (в копейках)[reference:7]
         price_kopecks = 0
         old_price_kopecks = 0
         sizes = p.get("sizes") or []
@@ -152,7 +154,7 @@ def analyze_wb_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
             price_kopecks = price_info.get("product") or price_info.get("total") or 0
             old_price_kopecks = price_info.get("basic") or 0
 
-        # Fallback на старый формат
+        # Fallback для старых форматов
         if price_kopecks == 0:
             price_kopecks = p.get("salePriceU") or p.get("priceU") or 0
             old_price_kopecks = p.get("priceU") or 0
@@ -174,33 +176,41 @@ def analyze_wb_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
         )
 
         return {
-            "link": url,
-            "marketplace": "Wildberries",
-            "sku": sku,
-            "name": name,
-            "brand": brand,
-            "seller": seller,
-            "price": price,
-            "old_price": old_price,
+            "link": url, "marketplace": "Wildberries", "sku": sku,
+            "name": name, "brand": brand, "seller": seller,
+            "price": price, "old_price": old_price,
             "discount_percent": discount_percent,
-            "rating": rating,
-            "reviews_count": reviews_count,
-            "risk_level": risk_level,
-            "risk_reason": risk_reason,
+            "rating": rating, "reviews_count": reviews_count,
+            "risk_level": risk_level, "risk_reason": risk_reason,
             "delivery_time": "1-3 дня"
         }
     except Exception as e:
-        logging.error(f"Ошибка парсинга WB: {e}")
+        logging.error(f"Ошибка WB: {e}")
         return None
 
-# --- Ozon (исправлено: реальная старая цена) ---
-
+# --- Парсер Ozon (с полными заголовками) ---
 def analyze_ozon_product(sku: str, url: str, path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     try:
         clean_url = f"https://www.ozon.ru/product/{sku}/"
-        logging.info(f"Загрузка страницы Ozon: {clean_url}")
+        logging.info(f"Загрузка Ozon: {clean_url}")
 
-        resp = c_requests.get(clean_url, impersonate="chrome120", timeout=20)
+        # Полный набор заголовков, чтобы минимизировать риск 403[reference:8]
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        resp = c_requests.get(clean_url, headers=headers, impersonate="chrome120", timeout=20)
         logging.info(f"Ozon ответ: статус {resp.status_code}")
 
         if resp.status_code != 200:
@@ -208,7 +218,6 @@ def analyze_ozon_product(sku: str, url: str, path: Optional[str] = None) -> Opti
             return None
 
         soup = BeautifulSoup(resp.text, 'html.parser')
-
         name = None
         price = 0
         old_price = 0
@@ -217,25 +226,22 @@ def analyze_ozon_product(sku: str, url: str, path: Optional[str] = None) -> Opti
         brand = "Не указан"
         seller = "Ozon"
 
+        # Ищем JSON-LD (Schema.org Product)
         for script in soup.find_all('script', type='application/ld+json'):
             try:
                 data = json.loads(script.string or "")
                 items = data if isinstance(data, list) else [data]
                 for item in items:
-                    if not isinstance(item, dict):
+                    if not isinstance(item, dict) or item.get("@type") != "Product":
                         continue
-                    if item.get("@type") != "Product":
-                        continue
-
                     if item.get("name"):
                         name = item["name"]
-
                     b = item.get("brand")
                     if isinstance(b, dict):
                         brand = b.get("name") or brand
                     elif isinstance(b, str):
                         brand = b
-
+                    
                     offers = item.get("offers", {})
                     if isinstance(offers, list):
                         offers = offers[0] if offers else {}
@@ -246,14 +252,12 @@ def analyze_ozon_product(sku: str, url: str, path: Optional[str] = None) -> Opti
                         ps = offers.get("priceSpecification")
                         specs = ps if isinstance(ps, list) else [ps] if isinstance(ps, dict) else []
                         for spec in specs:
-                            if not isinstance(spec, dict):
-                                continue
-                            if spec.get("priceType") in ("ListPrice", "StrikethroughPrice"):
+                            if isinstance(spec, dict) and spec.get("priceType") in ("ListPrice", "StrikethroughPrice"):
                                 try:
                                     old_price = int(float(spec.get("price", 0)))
                                 except (TypeError, ValueError):
                                     pass
-
+                    
                     agg = item.get("aggregateRating", {})
                     if isinstance(agg, dict):
                         try:
@@ -265,18 +269,19 @@ def analyze_ozon_product(sku: str, url: str, path: Optional[str] = None) -> Opti
                         except (TypeError, ValueError):
                             reviews_count = 0
             except Exception as e:
-                logging.debug(f"JSON-LD parse: {e}")
+                logging.debug(f"JSON-LD: {e}")
 
         if not name:
             og = soup.find('meta', property='og:title')
             if og and og.get('content'):
                 name = og['content']
 
+        # Фолбэк для цены из скриптов
         if price == 0:
             m = re.search(r'"price"\s*:\s*"?(\d+)"?', resp.text)
             if m:
                 price = int(m.group(1))
-
+        
         if old_price == 0:
             m = re.search(r'"(?:originalPrice|oldPrice)"\s*:\s*"?(\d+)"?', resp.text)
             if m:
@@ -299,118 +304,92 @@ def analyze_ozon_product(sku: str, url: str, path: Optional[str] = None) -> Opti
         )
 
         return {
-            "link": url,
-            "marketplace": "Ozon",
-            "sku": sku,
-            "name": name,
-            "brand": brand,
-            "seller": seller,
-            "price": price,
-            "old_price": old_price,
+            "link": url, "marketplace": "Ozon", "sku": sku,
+            "name": name, "brand": brand, "seller": seller,
+            "price": price, "old_price": old_price,
             "discount_percent": discount_percent,
-            "rating": rating,
-            "reviews_count": reviews_count,
-            "risk_level": risk_level,
-            "risk_reason": risk_reason,
+            "rating": rating, "reviews_count": reviews_count,
+            "risk_level": risk_level, "risk_reason": risk_reason,
             "delivery_time": "По данным площадки"
         }
     except Exception as e:
-        logging.error(f"Ошибка парсинга Ozon: {e}")
+        logging.error(f"Ошибка Ozon: {e}")
         return None
 
 def calculate_replica_risk(brand: str, seller: str, rating: float, reviews_count: int, discount_percent: int) -> tuple[str, str]:
     score = 0
     reasons = []
-
     if brand and seller and (brand.lower() in seller.lower() or seller.lower() in ["wildberries", "ozon"]):
         score -= 2
         reasons.append("Официальный продавец/маркетплейс")
-
     if rating < 4.0 and reviews_count > 10:
         score += 3
-        reasons.append("Низкий рейтинг товара (< 4.0)")
+        reasons.append("Низкий рейтинг (< 4.0)")
     elif rating >= 4.7:
         score -= 1
-
     if reviews_count < 5:
         score += 2
         reasons.append("Мало отзывов")
-
     if discount_percent > 70:
         score += 2
-        reasons.append(f"Аномально большая скидка ({discount_percent}%)")
-
+        reasons.append(f"Скидка > 70%")
+    
     if score >= 3:
-        return "🔴 Высокий (Есть риск пали!)", " | ".join(reasons) or "Совокупность негативных факторов"
+        return "🔴 Высокий (риск пали!)", " | ".join(reasons) or "Совокупность факторов"
     elif score >= 1:
-        return "🟡 Средний (Требуется внимание)", " | ".join(reasons) or "Недостаточно проверен"
+        return "🟡 Средний", " | ".join(reasons) or "Недостаточно проверен"
     else:
-        return "🟢 Низкий (Надёжное предложение)", "Продавец и отзывы внушают доверие"
+        return "🟢 Низкий", "Продавец и отзывы внушают доверие"
 
 # --- Telegram ---
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 **Привет! Я Sellertano — твой умный Анализатор Рынка.**\n\n"
-        "🔍 **Что я умею:**\n"
-        "• Анализировать товары на Wildberries и Ozon.\n"
-        "• Считать выгоду и реальную скидку.\n"
-        "• Оценивать **риск подделки (пали)**.\n"
-        "• Сохранять данные в Google Таблицу.\n\n"
-        "📥 **Отправь ссылку на любой товар!**",
+        "👋 **Привет! Я Sellertano — Анализатор Рынка.**\n\n"
+        "📥 **Отправь ссылку на товар Wildberries или Ozon!**",
         parse_mode="Markdown"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text.startswith("http"):
-        await update.message.reply_text("Пожалуйста, отправь прямую ссылку на товар (http:// или https://).")
+        await update.message.reply_text("❌ Нужна прямая ссылка (http:// или https://).")
         return
 
     sku, mp, path = extract_product_info_from_url(text)
-
     if not sku:
-        await update.message.reply_text("⚠️ Не удалось распознать ссылку. Поддерживаются Wildberries и Ozon.")
+        await update.message.reply_text("⚠️ Не удалось распознать ссылку.")
         return
 
-    await update.message.reply_text(f"🔎 Анализирую товар на {mp}...")
+    await update.message.reply_text(f"🔎 Анализирую {mp}...")
 
-    # Выносим блокирующие парсеры в отдельный поток
+    # Блокирующие вызовы в отдельный поток, чтобы не вешать бота
     if mp == "Wildberries":
         data = await asyncio.to_thread(analyze_wb_product, sku, text)
     else:
         data = await asyncio.to_thread(analyze_ozon_product, sku, text, path)
 
     if not data:
-        await update.message.reply_text("❌ Не удалось получить данные. Возможно, товар недоступен или площадка блокирует запросы.")
+        await update.message.reply_text("❌ Данные не получены. Площадка блокирует запросы с сервера.")
         return
 
-    # Сохранение в таблицу тоже блокирующее — тоже в поток
     await asyncio.to_thread(save_to_sheet, data)
 
     report = (
         f"📊 **ОТЧЕТ SELLERTANO**\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 **Товар:** {data['name']}\n"
-        f"🏷 **Бренд:** {data['brand']}\n"
-        f"🏪 **Продавец:** {data['seller']}\n\n"
-        f"💰 **Текущая цена:** {data['price']} ₽\n"
-        f"🏷 **Базовая цена:** {data['old_price']} ₽\n"
-        f"🔥 **Выгода:** {data['discount_percent']}%"
-        f" (Экономия: {max(0, data['old_price'] - data['price'])} ₽)\n\n"
-        f"⭐ **Рейтинг:** {data['rating']} / 5.0 ({data['reviews_count']} отзывов)\n"
-        f"🚚 **Доставка:** ~{data['delivery_time']}\n"
-        f"🛡 **Риск подделки:** {data['risk_level']}\n"
-        f"💬 _Детали:_ {data['risk_reason']}\n"
+        f"📦 **{data['name']}**\n"
+        f"🏷 Бренд: {data['brand']} | 🏪 {data['seller']}\n\n"
+        f"💰 Цена: **{data['price']} ₽**\n"
+        f"🏷 Базовая: {data['old_price']} ₽\n"
+        f"🔥 Выгода: **{data['discount_percent']}%** (экономия {max(0, data['old_price'] - data['price'])} ₽)\n\n"
+        f"⭐ Рейтинг: {data['rating']} / 5.0 ({data['reviews_count']} отзывов)\n"
+        f"🛡 Риск подделки: **{data['risk_level']}**\n"
+        f"💬 _{data['risk_reason']}_\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ _Данные сохранены в Sellertano DB._"
+        f"✅ Сохранено в базу."
     )
-
     await update.message.reply_text(report, parse_mode="Markdown")
 
 async def post_init(application: Application) -> None:
@@ -430,7 +409,7 @@ def main():
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Sellertano Market Analyzer запущен!")
+    print("Sellertano Analyzer запущен!")
     application.run_polling()
 
 if __name__ == '__main__':
