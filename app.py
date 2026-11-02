@@ -84,14 +84,31 @@ def save_to_sheet(analysis_data: Dict[str, Any]) -> bool:
 
 # --- Парсеры публичных данных маркетплейсов ---
 
+def resolve_short_url(url: str) -> str:
+    """Разворачивает короткие ссылки маркетплейсов (ozon.ru/t/... и т.д.) в полные."""
+    if any(domain in url for domain in ["ozon.ru/t/", "wb.ru/", "clck.ru/"]):
+        try:
+            # Делаем запрос с разрешением редиректов, чтобы получить финальный URL
+            resp = requests.head(url, allow_redirects=True, timeout=5)
+            return resp.url
+        except Exception:
+            try:
+                resp = requests.get(url, allow_redirects=True, timeout=5)
+                return resp.url
+            except Exception:
+                pass
+    return url
+
 def extract_sku_and_mp(url: str) -> tuple[Optional[str], Optional[str]]:
-    """Определяет маркетплейс и вытаскивает артикул из ссылки."""
-    if "wildberries.ru" in url or "wb.ru" in url:
-        match = re.search(r'/catalog/(\d+)/detail', url)
+    """Определяет маркетплейс и вытаскивает артикул из ссылки (с учетом коротких ссылок)."""
+    resolved_url = resolve_short_url(url)
+    
+    if "wildberries.ru" in resolved_url or "wb.ru" in resolved_url:
+        match = re.search(r'/catalog/(\d+)/detail', resolved_url)
         if match:
             return match.group(1), "Wildberries"
-    elif "ozon.ru" in url:
-        match = re.search(r'/product/(?:[^/]+-)?(\d+)', url)
+    elif "ozon.ru" in resolved_url:
+        match = re.search(r'/product/(?:[^/]+-)?(\d+)', resolved_url)
         if match:
             return match.group(1), "Ozon"
     return None, None
