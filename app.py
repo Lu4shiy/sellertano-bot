@@ -124,11 +124,13 @@ def extract_product_info_from_url(url: str) -> tuple[Optional[str], Optional[str
     return None, None, None
 
 def analyze_wb_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
-    """Сбор и анализ данных Wildberries через открытые API."""
+    """Сбор и анализ данных Wildberries через актуальное публичное API v4."""
     try:
-        api_url = f"https://card.wb.ru/cards/v1/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={sku}"
+        # Используем современный эндпоинт v4
+        api_url = f"https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={sku}"
         resp = requests.get(api_url, timeout=10)
         if resp.status_code != 200:
+            logging.warning(f"WB API ответил со статусом: {resp.status_code}")
             return None
         
         data = resp.json()
@@ -143,6 +145,7 @@ def analyze_wb_product(sku: str, url: str) -> Optional[Dict[str, Any]]:
         rating = p.get("reviewRating", 0.0)
         reviews_count = p.get("feedbacks", 0)
         
+        # На WB цены передаются в копейках (делим на 100)
         price_raw = p.get("salePriceU", 0) / 100
         old_price_raw = p.get("priceU", 0) / 100
         
